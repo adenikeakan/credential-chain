@@ -67,7 +67,7 @@
             (not (var-get contract-paused)))
         false))
 
-(define-private (can-upgrade 
+(define-private (check-can-upgrade 
         (user principal) 
         (credential-id uint))
     (match (map-get? user-credentials { user: user, credential-id: credential-id })
@@ -88,7 +88,7 @@
     (ok (some (var-get token-uri))))
 
 (define-read-only (get-user-credential (user principal) (credential-id uint))
-    (map-get? user-credentials { user: user, credential-id: credential-id }))
+    (ok (map-get? user-credentials { user: user, credential-id: credential-id })))
 
 ;; Public Functions
 (define-public (add-credential-type 
@@ -100,29 +100,27 @@
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
         (asserts! (not (var-get contract-paused)) ERR-PAUSED)
-        (map-set credential-types id
+        (ok (map-set credential-types id
             {
                 name: name,
                 required-points: required-points,
                 verification-threshold: verification-threshold,
                 active: true,
                 metadata: metadata
-            })
-        (ok true)))
+            }))))
 
 (define-public (set-verifier 
         (account principal) 
         (active bool))
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
-        (map-set verifiers account
+        (ok (map-set verifiers account
             {
                 active: active,
                 verification-count: u0,
                 last-verification: u0,
                 reputation: u100
-            })
-        (ok true)))
+            }))))
 
 (define-public (add-verification 
         (user principal) 
@@ -132,23 +130,23 @@
         (asserts! (not (var-get contract-paused)) ERR-PAUSED)
         (asserts! (is-verifier tx-sender) ERR-INVALID-VERIFIER)
         (asserts! (is-active-credential credential-id) ERR-INVALID-CREDENTIAL)
-        
-        (match (get-user-credential user credential-id)
+
+        (match (unwrap! (get-user-credential user credential-id) ERR-INVALID-CREDENTIAL)
             existing 
-                (map-set user-credentials 
+                (ok (map-set user-credentials 
                     { user: user, credential-id: credential-id }
                     {
                         level: (get level existing),
                         points: (+ (get points existing) points),
                         last-updated: block-height,
-                        verifications: (unwrap-panic 
+                        verifications: (unwrap! 
                             (as-max-len? 
                                 (append (get verifications existing) tx-sender)
-                                u10)),
+                                u10)
+                            ERR-INVALID-CREDENTIAL),
                         token-id: (get token-id existing)
-                    })
-            ;; If no existing record, create new
-            (map-set user-credentials
+                    }))
+            (ok (map-set user-credentials
                 { user: user, credential-id: credential-id }
                 {
                     level: u1,
@@ -156,23 +154,24 @@
                     last-updated: block-height,
                     verifications: (list tx-sender),
                     token-id: none
-                }))
-        (ok true)))
+                })))))
 
 (define-public (upgrade-credential 
         (credential-id uint))
     (begin
         (asserts! (not (var-get contract-paused)) ERR-PAUSED)
         (asserts! (is-active-credential credential-id) ERR-INVALID-CREDENTIAL)
-        (asserts! (can-upgrade tx-sender credential-id) ERR-INSUFFICIENT-POINTS)
-        
+        (asserts! (check-can-upgrade tx-sender credential-id) ERR-INSUFFICIENT-POINTS)
+
         (let ((new-token-id (+ (var-get last-token-id) u1)))
+            ;; Update token ownership
             (map-set token-owners new-token-id { owner: tx-sender })
             (var-set last-token-id new-token-id)
-            
-            (match (get-user-credential tx-sender credential-id)
+
+            ;; Update credential
+            (match (unwrap! (get-user-credential tx-sender credential-id) ERR-INVALID-CREDENTIAL)
                 existing 
-                    (map-set user-credentials 
+                    (ok (map-set user-credentials 
                         { user: tx-sender, credential-id: credential-id }
                         {
                             level: (+ (get level existing) u1),
@@ -180,19 +179,16 @@
                             last-updated: block-height,
                             verifications: (list),
                             token-id: (some new-token-id)
-                        })
-                    (err ERR-INVALID-CREDENTIAL)))
-        (ok true)))
+                        }))
+                ERR-INVALID-CREDENTIAL))))
 
 ;; Admin Functions
 (define-public (pause-contract)
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
-        (var-set contract-paused true)
-        (ok true)))
+        (ok (var-set contract-paused true))))
 
 (define-public (resume-contract)
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
-        (var-set contract-paused false)
-        (ok true)))
+        (ok (var-set contract-paused false))))
