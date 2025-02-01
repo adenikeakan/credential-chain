@@ -1,9 +1,9 @@
 ;; CredentialChain: Dynamic Academic Credential Evolution System
 ;; Version: 1.1.0
-;; Implements: SIP-009 (NFT Standard)
+;; Implements local NFT trait
 
 ;; Traits
-(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait nft-trait .nft-trait.nft-trait)
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -116,6 +116,7 @@
     (let ((new-id (+ (var-get last-token-id) u1)))
         (begin
             (var-set last-token-id new-id)
+            (map-set token-owners new-id { owner: user })
             (map-set UserCredentials
                 { user: user, credential-id: credential-id }
                 (merge (unwrap-panic (get-user-credential user credential-id))
@@ -146,9 +147,15 @@
 (define-read-only (get-token-uri (token-id uint))
     (ok (var-get token-uri)))
 
+(define-map token-owners
+    uint 
+    { owner: principal })
+
 (define-read-only (get-owner (token-id uint))
-    (let ((credential-data (filter map-fn (map-to-list UserCredentials))))
-    (ok (get user (element-at credential-data u0)))))
+    (ok (get owner 
+        (default-to 
+            { owner: tx-sender }
+            (map-get? token-owners token-id)))))
 
 ;; Public Functions
 (define-public (set-credential-type 
@@ -273,4 +280,3 @@
         (var-set paused false)
         (log-event "unpause" contract-owner u0 none)
         (ok true)))
-        
