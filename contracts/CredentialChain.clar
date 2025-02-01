@@ -1,282 +1,198 @@
 ;; CredentialChain: Dynamic Academic Credential Evolution System
-;; Version: 1.1.0
-;; Implements local NFT trait
-
-;; Traits
-(use-trait nft-trait .nft-trait.nft-trait)
+;; Version: 2.0.0 (2025 Edition)
 
 ;; Constants
-(define-constant contract-owner tx-sender)
+(define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INVALID-CREDENTIAL (err u101))
 (define-constant ERR-INSUFFICIENT-POINTS (err u102))
-(define-constant ERR-ALREADY-VERIFIED (err u103))
-(define-constant ERR-INVALID-VERIFIER (err u104))
-(define-constant ERR-EXPIRED-VERIFICATION (err u105))
-(define-constant ERR-COOLDOWN-ACTIVE (err u106))
-(define-constant VERIFICATION-EXPIRY u10000) ;; ~7 days in blocks
-
-;; SIP-009 NFT Data Variables
-(define-data-var last-token-id uint u0)
-(define-data-var token-uri (string-utf8 256) u"")
+(define-constant ERR-INVALID-VERIFIER (err u103))
+(define-constant ERR-PAUSED (err u104))
+(define-constant ERR-INVALID-TOKEN (err u105))
 
 ;; Data Variables
+(define-data-var last-token-id uint u0)
+(define-data-var token-uri (string-utf8 256) u"")
 (define-data-var minimum-verifiers uint u3)
-(define-data-var upgrade-cooldown uint u144) ;; ~24 hours in blocks
-(define-data-var paused bool false)
+(define-data-var upgrade-cooldown uint u144)
+(define-data-var contract-paused bool false)
 
 ;; Data Maps
-(define-map Verifiers
-    principal
-    {
-        status: bool,
-        verification-count: uint,
-        last-verification: uint,
-        reputation-score: uint,
-        specializations: (list 5 uint)
-    })
-
-(define-map CredentialTypes 
-    { credential-id: uint } 
-    { 
-        name: (string-ascii 50),
-        level: uint,
-        required-points: uint,
-        verification-threshold: uint,
-        cooldown-period: uint,
-        active: bool,
-        metadata-uri: (optional (string-utf8 256))
-    })
-
-(define-map UserCredentials 
-    { user: principal, credential-id: uint } 
-    {
-        current-level: uint,
-        points: uint,
-        last-updated: uint,
-        verifications: (list 10 principal),
-        achievement-log: (list 20 {
-            timestamp: uint,
-            points: uint,
-            verifier: principal,
-            evidence-hash: (optional (buff 32))
-        }),
-        token-id: (optional uint)
-    })
-
-;; Events
-(define-data-var last-event-id uint u0)
-
-(define-map Events
-    uint
-    {
-        event-type: (string-ascii 20),
-        user: principal,
-        credential-id: uint,
-        timestamp: uint,
-        data: (optional (string-utf8 256))
-    })
-
-;; Private Functions
-(define-private (is-contract-owner)
-    (is-eq tx-sender contract-owner))
-
-(define-private (is-active (credential {
-        name: (string-ascii 50),
-        level: uint,
-        required-points: uint,
-        verification-threshold: uint,
-        cooldown-period: uint,
-        active: bool,
-        metadata-uri: (optional (string-utf8 256))
-    }))
-    (and 
-        (get active credential)
-        (not (var-get paused))))
-
-(define-private (log-event 
-        (event-type (string-ascii 20))
-        (user principal)
-        (credential-id uint)
-        (data (optional (string-utf8 256))))
-    (begin
-        (var-set last-event-id (+ (var-get last-event-id) u1))
-        (map-set Events
-            (var-get last-event-id)
-            {
-                event-type: event-type,
-                user: user,
-                credential-id: credential-id,
-                timestamp: block-height,
-                data: data
-            })
-        (var-get last-event-id)))
-
-(define-private (mint-credential-nft (user principal) (credential-id uint))
-    (let ((new-id (+ (var-get last-token-id) u1)))
-        (begin
-            (var-set last-token-id new-id)
-            (map-set token-owners new-id { owner: user })
-            (map-set UserCredentials
-                { user: user, credential-id: credential-id }
-                (merge (unwrap-panic (get-user-credential user credential-id))
-                    { token-id: (some new-id) }))
-            new-id)))
-
-;; Read-Only Functions
-(define-read-only (get-credential-type (credential-id uint))
-    (map-get? CredentialTypes { credential-id: credential-id }))
-
-(define-read-only (get-user-credential (user principal) (credential-id uint))
-    (map-get? UserCredentials { user: user, credential-id: credential-id }))
-
-(define-read-only (is-authorized-verifier (verifier principal))
-    (default-to 
-        false
-        (get status (map-get? Verifiers verifier))))
-
-(define-read-only (get-verifier-reputation (verifier principal))
-    (default-to
-        u0
-        (get reputation-score (map-get? Verifiers verifier))))
-
-;; SIP-009 NFT Functions
-(define-read-only (get-last-token-id)
-    (ok (var-get last-token-id)))
-
-(define-read-only (get-token-uri (token-id uint))
-    (ok (var-get token-uri)))
-
-(define-map token-owners
+(define-map token-owners 
     uint 
     { owner: principal })
 
-(define-read-only (get-owner (token-id uint))
-    (ok (get owner 
-        (default-to 
-            { owner: tx-sender }
-            (map-get? token-owners token-id)))))
+(define-map verifiers
+    principal
+    {
+        active: bool,
+        verification-count: uint,
+        last-verification: uint,
+        reputation: uint
+    })
+
+(define-map credential-types 
+    uint 
+    { 
+        name: (string-ascii 50),
+        required-points: uint,
+        verification-threshold: uint,
+        active: bool,
+        metadata: (string-utf8 256)
+    })
+
+(define-map user-credentials 
+    { user: principal, credential-id: uint } 
+    {
+        level: uint,
+        points: uint,
+        last-updated: uint,
+        verifications: (list 10 principal),
+        token-id: (optional uint)
+    })
+
+;; Private Functions
+(define-private (is-admin)
+    (is-eq tx-sender CONTRACT-OWNER))
+
+(define-private (is-verifier (account principal))
+    (default-to 
+        false
+        (get active (map-get? verifiers account))))
+
+(define-private (is-active-credential (credential-id uint))
+    (match (map-get? credential-types credential-id)
+        credential (and 
+            (get active credential)
+            (not (var-get contract-paused)))
+        false))
+
+(define-private (can-upgrade 
+        (user principal) 
+        (credential-id uint))
+    (match (map-get? user-credentials { user: user, credential-id: credential-id })
+        credential (and
+            (match (map-get? credential-types credential-id)
+                type (>= (get points credential) (get required-points type))
+                false)
+            (>= (len (get verifications credential)) (var-get minimum-verifiers)))
+        false))
+
+;; Read-Only Functions
+(define-read-only (get-token-owner (token-id uint))
+    (ok (match (map-get? token-owners token-id)
+        owner (some (get owner owner))
+        none)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (ok (some (var-get token-uri))))
+
+(define-read-only (get-user-credential (user principal) (credential-id uint))
+    (map-get? user-credentials { user: user, credential-id: credential-id }))
 
 ;; Public Functions
-(define-public (set-credential-type 
-        (credential-id uint) 
-        (name (string-ascii 50)) 
+(define-public (add-credential-type 
+        (id uint) 
+        (name (string-ascii 50))
         (required-points uint)
         (verification-threshold uint)
-        (metadata-uri (optional (string-utf8 256))))
+        (metadata (string-utf8 256)))
     (begin
-        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
-        (ok (map-set CredentialTypes 
-            { credential-id: credential-id }
+        (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+        (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+        (map-set credential-types id
             {
                 name: name,
-                level: u1,
                 required-points: required-points,
                 verification-threshold: verification-threshold,
-                cooldown-period: (var-get upgrade-cooldown),
                 active: true,
-                metadata-uri: metadata-uri
-            }))))
-
-(define-public (set-verifier 
-        (verifier principal) 
-        (status bool)
-        (specializations (list 5 uint)))
-    (begin
-        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (ok (map-set Verifiers 
-            verifier
-            {
-                status: status,
-                verification-count: u0,
-                last-verification: u0,
-                reputation-score: u100,
-                specializations: specializations
-            }))))
-
-(define-public (submit-achievement 
-        (user principal) 
-        (credential-id uint) 
-        (points uint)
-        (verifier principal)
-        (evidence-hash (optional (buff 32))))
-    (let (
-        (credential (unwrap! (get-credential-type credential-id) ERR-INVALID-CREDENTIAL))
-        (current-data (default-to 
-            {
-                current-level: u1,
-                points: u0,
-                last-updated: u0,
-                verifications: (list),
-                achievement-log: (list),
-                token-id: none
-            } 
-            (get-user-credential user credential-id))))
-        (begin
-            (asserts! (is-authorized-verifier verifier) ERR-INVALID-VERIFIER)
-            (asserts! (is-active credential) ERR-INVALID-CREDENTIAL)
-            (asserts! (> (get reputation-score (unwrap! (map-get? Verifiers verifier) ERR-INVALID-VERIFIER)) u50) ERR-INVALID-VERIFIER)
-            (try! (map-set UserCredentials 
-                { user: user, credential-id: credential-id }
-                (merge current-data 
-                    {
-                        points: (+ (get points current-data) points),
-                        last-updated: block-height,
-                        achievement-log: (unwrap-panic (as-max-len? 
-                            (append 
-                                (get achievement-log current-data) 
-                                {
-                                    timestamp: block-height,
-                                    points: points,
-                                    verifier: verifier,
-                                    evidence-hash: evidence-hash
-                                }) 
-                            u20))
-                    })))
-            (log-event "achievement" user credential-id none)
-            (ok true))))
-
-(define-public (check-upgrade-eligibility (user principal) (credential-id uint))
-    (let (
-        (credential (unwrap! (get-credential-type credential-id) ERR-INVALID-CREDENTIAL))
-        (user-data (unwrap! (get-user-credential user credential-id) ERR-INVALID-CREDENTIAL)))
-        (ok (and
-            (>= (get points user-data) (get required-points credential))
-            (>= (len (get verifications user-data)) (get verification-threshold credential))
-            (>= (- block-height (get last-updated user-data)) (get cooldown-period credential))))))
-
-(define-public (upgrade-credential (user principal) (credential-id uint))
-    (let (
-        (can-upgrade (unwrap-panic (check-upgrade-eligibility user credential-id)))
-        (current-data (unwrap! (get-user-credential user credential-id) ERR-INVALID-CREDENTIAL)))
-        (begin
-            (asserts! can-upgrade ERR-INSUFFICIENT-POINTS)
-            (try! (map-set UserCredentials 
-                { user: user, credential-id: credential-id }
-                (merge current-data 
-                    {
-                        current-level: (+ (get current-level current-data) u1),
-                        points: u0,
-                        last-updated: block-height,
-                        verifications: (list),
-                        achievement-log: (list)
-                    })))
-            (mint-credential-nft user credential-id)
-            (log-event "upgrade" user credential-id none)
-            (ok true))))
-
-;; Emergency Functions
-(define-public (pause)
-    (begin
-        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (var-set paused true)
-        (log-event "pause" contract-owner u0 none)
+                metadata: metadata
+            })
         (ok true)))
 
-(define-public (unpause)
+(define-public (set-verifier 
+        (account principal) 
+        (active bool))
     (begin
-        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (var-set paused false)
-        (log-event "unpause" contract-owner u0 none)
+        (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+        (map-set verifiers account
+            {
+                active: active,
+                verification-count: u0,
+                last-verification: u0,
+                reputation: u100
+            })
+        (ok true)))
+
+(define-public (add-verification 
+        (user principal) 
+        (credential-id uint) 
+        (points uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+        (asserts! (is-verifier tx-sender) ERR-INVALID-VERIFIER)
+        (asserts! (is-active-credential credential-id) ERR-INVALID-CREDENTIAL)
+        
+        (match (get-user-credential user credential-id)
+            existing 
+                (map-set user-credentials 
+                    { user: user, credential-id: credential-id }
+                    {
+                        level: (get level existing),
+                        points: (+ (get points existing) points),
+                        last-updated: block-height,
+                        verifications: (unwrap-panic 
+                            (as-max-len? 
+                                (append (get verifications existing) tx-sender)
+                                u10)),
+                        token-id: (get token-id existing)
+                    })
+            ;; If no existing record, create new
+            (map-set user-credentials
+                { user: user, credential-id: credential-id }
+                {
+                    level: u1,
+                    points: points,
+                    last-updated: block-height,
+                    verifications: (list tx-sender),
+                    token-id: none
+                }))
+        (ok true)))
+
+(define-public (upgrade-credential 
+        (credential-id uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+        (asserts! (is-active-credential credential-id) ERR-INVALID-CREDENTIAL)
+        (asserts! (can-upgrade tx-sender credential-id) ERR-INSUFFICIENT-POINTS)
+        
+        (let ((new-token-id (+ (var-get last-token-id) u1)))
+            (map-set token-owners new-token-id { owner: tx-sender })
+            (var-set last-token-id new-token-id)
+            
+            (match (get-user-credential tx-sender credential-id)
+                existing 
+                    (map-set user-credentials 
+                        { user: tx-sender, credential-id: credential-id }
+                        {
+                            level: (+ (get level existing) u1),
+                            points: u0,
+                            last-updated: block-height,
+                            verifications: (list),
+                            token-id: (some new-token-id)
+                        })
+                    (err ERR-INVALID-CREDENTIAL)))
+        (ok true)))
+
+;; Admin Functions
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused true)
+        (ok true)))
+
+(define-public (resume-contract)
+    (begin
+        (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused false)
         (ok true)))
