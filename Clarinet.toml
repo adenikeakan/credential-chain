@@ -9,6 +9,9 @@ boot_contracts = ["pox", "costs-v2", "bns"]
 [contracts.CredentialChain]
 path = "contracts/CredentialChain.clar"
 
+[contracts.nft-trait]
+path = "contracts/nft-trait.clar"
+
 [repl]
 costs_version = 2
 parser_version = 2
