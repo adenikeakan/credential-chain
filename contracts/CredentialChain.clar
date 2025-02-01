@@ -1,6 +1,9 @@
 ;; CredentialChain: Dynamic Academic Credential Evolution System
-;; Author: [Your Name]
-;; Version: 1.0.0
+;; Version: 1.1.0
+;; Implements: SIP-009 (NFT Standard)
+
+;; Traits
+(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -9,10 +12,18 @@
 (define-constant ERR-INSUFFICIENT-POINTS (err u102))
 (define-constant ERR-ALREADY-VERIFIED (err u103))
 (define-constant ERR-INVALID-VERIFIER (err u104))
+(define-constant ERR-EXPIRED-VERIFICATION (err u105))
+(define-constant ERR-COOLDOWN-ACTIVE (err u106))
+(define-constant VERIFICATION-EXPIRY u10000) ;; ~7 days in blocks
+
+;; SIP-009 NFT Data Variables
+(define-data-var last-token-id uint u0)
+(define-data-var token-uri (string-utf8 256) u"")
 
 ;; Data Variables
 (define-data-var minimum-verifiers uint u3)
 (define-data-var upgrade-cooldown uint u144) ;; ~24 hours in blocks
+(define-data-var paused bool false)
 
 ;; Data Maps
 (define-map Verifiers
@@ -20,7 +31,9 @@
     {
         status: bool,
         verification-count: uint,
-        last-verification: uint
+        last-verification: uint,
+        reputation-score: uint,
+        specializations: (list 5 uint)
     })
 
 (define-map CredentialTypes 
@@ -31,7 +44,8 @@
         required-points: uint,
         verification-threshold: uint,
         cooldown-period: uint,
-        active: bool
+        active: bool,
+        metadata-uri: (optional (string-utf8 256))
     })
 
 (define-map UserCredentials 
@@ -44,8 +58,23 @@
         achievement-log: (list 20 {
             timestamp: uint,
             points: uint,
-            verifier: principal
-        })
+            verifier: principal,
+            evidence-hash: (optional (buff 32))
+        }),
+        token-id: (optional uint)
+    })
+
+;; Events
+(define-data-var last-event-id uint u0)
+
+(define-map Events
+    uint
+    {
+        event-type: (string-ascii 20),
+        user: principal,
+        credential-id: uint,
+        timestamp: uint,
+        data: (optional (string-utf8 256))
     })
 
 ;; Private Functions
@@ -58,9 +87,40 @@
         required-points: uint,
         verification-threshold: uint,
         cooldown-period: uint,
-        active: bool
+        active: bool,
+        metadata-uri: (optional (string-utf8 256))
     }))
-    (get active credential))
+    (and 
+        (get active credential)
+        (not (var-get paused))))
+
+(define-private (log-event 
+        (event-type (string-ascii 20))
+        (user principal)
+        (credential-id uint)
+        (data (optional (string-utf8 256))))
+    (begin
+        (var-set last-event-id (+ (var-get last-event-id) u1))
+        (map-set Events
+            (var-get last-event-id)
+            {
+                event-type: event-type,
+                user: user,
+                credential-id: credential-id,
+                timestamp: block-height,
+                data: data
+            })
+        (var-get last-event-id)))
+
+(define-private (mint-credential-nft (user principal) (credential-id uint))
+    (let ((new-id (+ (var-get last-token-id) u1)))
+        (begin
+            (var-set last-token-id new-id)
+            (map-set UserCredentials
+                { user: user, credential-id: credential-id }
+                (merge (unwrap-panic (get-user-credential user credential-id))
+                    { token-id: (some new-id) }))
+            new-id)))
 
 ;; Read-Only Functions
 (define-read-only (get-credential-type (credential-id uint))
@@ -74,14 +134,32 @@
         false
         (get status (map-get? Verifiers verifier))))
 
+(define-read-only (get-verifier-reputation (verifier principal))
+    (default-to
+        u0
+        (get reputation-score (map-get? Verifiers verifier))))
+
+;; SIP-009 NFT Functions
+(define-read-only (get-last-token-id)
+    (ok (var-get last-token-id)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (ok (var-get token-uri)))
+
+(define-read-only (get-owner (token-id uint))
+    (let ((credential-data (filter map-fn (map-to-list UserCredentials))))
+    (ok (get user (element-at credential-data u0)))))
+
 ;; Public Functions
 (define-public (set-credential-type 
         (credential-id uint) 
         (name (string-ascii 50)) 
         (required-points uint)
-        (verification-threshold uint))
+        (verification-threshold uint)
+        (metadata-uri (optional (string-utf8 256))))
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
         (ok (map-set CredentialTypes 
             { credential-id: credential-id }
             {
@@ -90,10 +168,14 @@
                 required-points: required-points,
                 verification-threshold: verification-threshold,
                 cooldown-period: (var-get upgrade-cooldown),
-                active: true
+                active: true,
+                metadata-uri: metadata-uri
             }))))
 
-(define-public (set-verifier (verifier principal) (status bool))
+(define-public (set-verifier 
+        (verifier principal) 
+        (status bool)
+        (specializations (list 5 uint)))
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
         (ok (map-set Verifiers 
@@ -101,14 +183,17 @@
             {
                 status: status,
                 verification-count: u0,
-                last-verification: u0
+                last-verification: u0,
+                reputation-score: u100,
+                specializations: specializations
             }))))
 
 (define-public (submit-achievement 
         (user principal) 
         (credential-id uint) 
         (points uint)
-        (verifier principal))
+        (verifier principal)
+        (evidence-hash (optional (buff 32))))
     (let (
         (credential (unwrap! (get-credential-type credential-id) ERR-INVALID-CREDENTIAL))
         (current-data (default-to 
@@ -117,13 +202,15 @@
                 points: u0,
                 last-updated: u0,
                 verifications: (list),
-                achievement-log: (list)
+                achievement-log: (list),
+                token-id: none
             } 
             (get-user-credential user credential-id))))
         (begin
             (asserts! (is-authorized-verifier verifier) ERR-INVALID-VERIFIER)
             (asserts! (is-active credential) ERR-INVALID-CREDENTIAL)
-            (ok (map-set UserCredentials 
+            (asserts! (> (get reputation-score (unwrap! (map-get? Verifiers verifier) ERR-INVALID-VERIFIER)) u50) ERR-INVALID-VERIFIER)
+            (try! (map-set UserCredentials 
                 { user: user, credential-id: credential-id }
                 (merge current-data 
                     {
@@ -135,10 +222,13 @@
                                 {
                                     timestamp: block-height,
                                     points: points,
-                                    verifier: verifier
+                                    verifier: verifier,
+                                    evidence-hash: evidence-hash
                                 }) 
                             u20))
-                    }))))))
+                    })))
+            (log-event "achievement" user credential-id none)
+            (ok true))))
 
 (define-public (check-upgrade-eligibility (user principal) (credential-id uint))
     (let (
@@ -155,7 +245,7 @@
         (current-data (unwrap! (get-user-credential user credential-id) ERR-INVALID-CREDENTIAL)))
         (begin
             (asserts! can-upgrade ERR-INSUFFICIENT-POINTS)
-            (ok (map-set UserCredentials 
+            (try! (map-set UserCredentials 
                 { user: user, credential-id: credential-id }
                 (merge current-data 
                     {
@@ -164,13 +254,23 @@
                         last-updated: block-height,
                         verifications: (list),
                         achievement-log: (list)
-                    }))))))
+                    })))
+            (mint-credential-nft user credential-id)
+            (log-event "upgrade" user credential-id none)
+            (ok true))))
 
-;; Initialize contract
-(define-public (initialize (new-cooldown uint) (new-min-verifiers uint))
+;; Emergency Functions
+(define-public (pause)
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (var-set upgrade-cooldown new-cooldown)
-        (var-set minimum-verifiers new-min-verifiers)
+        (var-set paused true)
+        (log-event "pause" contract-owner u0 none)
+        (ok true)))
+
+(define-public (unpause)
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (var-set paused false)
+        (log-event "unpause" contract-owner u0 none)
         (ok true)))
         
